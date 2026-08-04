@@ -4,37 +4,53 @@ import { CODEBASE_MEMORY_PROMPT } from "./prompt.js";
 
 const AUTO_REFRESH_INTERVAL_MS = 60_000;
 
+type SessionResources = Pick<ExtensionContext, "cwd" | "signal" | "ui">;
+
+function readSessionResources(ctx: ExtensionContext): SessionResources | undefined {
+  try {
+    return {
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      ui: ctx.ui,
+    };
+  } catch {
+    // A session_start handler from an old runner can resume after reload and
+    // receive a context that has already been invalidated.
+    return undefined;
+  }
+}
+
 export function registerLifecycle(pi: ExtensionAPI, services: CbmServices) {
   let refreshTimer: ReturnType<typeof setInterval> | undefined;
   // Monotonically increasing session generation. Bumped synchronously on every
   // session start and shutdown so that interval callbacks already queued or
-  // still awaiting from a previous session can bail out before touching a stale
-  // ctx (whose accessors throw after session replacement/reload).
+  // still awaiting from a previous session can bail out before using old
+  // session-bound resources.
   let sessionGeneration = 0;
   // The session generation that currently owns an in-flight index, used to keep
   // a single active index per session without leaking state across sessions.
   let inFlightGeneration: number | undefined;
 
-  async function indexCurrentRepo(ctx: ExtensionContext, generation: number) {
+  async function indexCurrentRepo(session: SessionResources, generation: number) {
     if (generation !== sessionGeneration) return; // stale session: skip
-    if (inFlightGeneration === generation || ctx.signal?.aborted) return;
+    if (inFlightGeneration === generation || session.signal?.aborted) return;
 
     inFlightGeneration = generation;
     try {
-      const result = await services.projects.indexCurrentRepo(ctx.cwd, ctx.signal);
+      const result = await services.projects.indexCurrentRepo(session.cwd, session.signal);
       if (generation !== sessionGeneration) return; // session changed mid-run
       if (result.status === "skipped") {
-        ctx.ui.setStatus("codebase-memory", `cbm skipped: ${result.reason}`);
+        session.ui.setStatus("codebase-memory", `cbm skipped: ${result.reason}`);
         return;
       }
 
       const nodes = typeof result.nodes === "number" ? ` · ${result.nodes} nodes` : "";
       const edges = typeof result.edges === "number" ? ` · ${result.edges} edges` : "";
-      ctx.ui.setStatus("codebase-memory", `cbm ${result.project}${nodes}${edges}`);
+      session.ui.setStatus("codebase-memory", `cbm ${result.project}${nodes}${edges}`);
     } catch (error) {
       if (generation !== sessionGeneration) return;
       const reason = error instanceof Error && error.message ? `: ${error.message}` : "";
-      ctx.ui.setStatus("codebase-memory", `cbm index failed${reason}`);
+      session.ui.setStatus("codebase-memory", `cbm index failed${reason}`);
     } finally {
       if (inFlightGeneration === generation) inFlightGeneration = undefined;
     }
@@ -45,6 +61,9 @@ export function registerLifecycle(pi: ExtensionAPI, services: CbmServices) {
   }));
 
   pi.on("session_start", (_event, ctx) => {
+    const session = readSessionResources(ctx);
+    if (!session) return;
+
     services.settings.reload();
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = undefined;
@@ -52,9 +71,9 @@ export function registerLifecycle(pi: ExtensionAPI, services: CbmServices) {
     const generation = sessionGeneration + 1;
     sessionGeneration = generation;
 
-    void indexCurrentRepo(ctx, generation);
+    void indexCurrentRepo(session, generation);
     refreshTimer = setInterval(() => {
-      void indexCurrentRepo(ctx, generation);
+      void indexCurrentRepo(session, generation);
     }, AUTO_REFRESH_INTERVAL_MS);
   });
 
@@ -62,7 +81,7 @@ export function registerLifecycle(pi: ExtensionAPI, services: CbmServices) {
     if (refreshTimer) clearInterval(refreshTimer);
     refreshTimer = undefined;
     // Invalidate synchronously so already-queued/running callbacks from this
-    // session give up instead of touching the now-stale ctx.
+    // session give up instead of updating old session-bound resources.
     sessionGeneration += 1;
   });
 }
